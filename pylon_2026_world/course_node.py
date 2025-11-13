@@ -84,6 +84,33 @@ def resolve_params_path(path_param: str, pkg_name: str = PKG_NAME) -> str:
     )
 
 
+# --- resolve best-score path (1-line CSV) ---
+def _resolve_best_log_path(user_param: Optional[str], default_dir: str) -> str:
+    """
+    If user_param is:
+      - absolute DIR  -> use <dir>/best_score.csv
+      - absolute FILE -> use it directly
+      - relative name -> put it inside default_dir
+      - empty         -> use <default_dir>/best_score.csv
+    """
+    base = FsPath(default_dir)
+    base.mkdir(parents=True, exist_ok=True)
+
+    if user_param:
+        p = FsPath(user_param).expanduser()
+        if p.is_absolute():
+            if p.is_dir():
+                p.mkdir(parents=True, exist_ok=True)
+                return str(p / "best_score.csv")
+            else:
+                (p.parent or FsPath(".")).mkdir(parents=True, exist_ok=True)
+                return str(p)
+        # relative name → inside default_dir
+        return str(base / p.name)
+
+    return str(base / "best_score.csv")
+
+
 # ---------------- Small vec helpers ----------------
 def v2(x: float, y: float) -> Vec2:
     return (x, y)
@@ -262,39 +289,33 @@ class CourseNode(Node):
             self.get_parameter("laps_out_file").get_parameter_value().string_value
         )
 
-        # resolve to src/.../logs in dev
+        # LOG: where to write lap CSV (already resolved)
         self.lap_log_path = _resolve_lap_log_path(user_path)
         self.status(f"Logging laps to: {self.lap_log_path}")
 
-        # ensure dir + header once
-        log_dir = os.path.dirname(self.lap_log_path)
-        os.makedirs(log_dir, exist_ok=True)
-        if not os.path.exists(self.lap_log_path):
+        # lap CSV
+        if not FsPath(self.lap_log_path).exists():
             with open(self.lap_log_path, "w") as f:
-                f.write("lap,lap_time_s,lap_score\n")
+                f.write("lap,lap_time_s,lap_score,penalties_pylon,penalties_oob\n")
 
-        self.declare_parameter("max_logged_laps", 5)
-        self.max_logged_laps = int(
-            self.get_parameter("max_logged_laps").get_parameter_value().integer_value
-            or 5
-        )
-        self.logged_laps = 0
+        # per-lap penalty counters
+        self.missed_gates_count = 0  # +1 per gate missed
+        self.oob_events_count = 0  # +1 each time you leave bounds
 
-        # create header once
-        if not os.path.exists(self.lap_log_path):
-            with open(self.lap_log_path, "w") as f:
-                f.write("lap,lap_time_s,lap_score\n")
-
-        # prepare log file (create dir + header once)
-        log_dir = os.path.dirname(self.lap_log_path)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
-        if not os.path.exists(self.lap_log_path):
-            with open(self.lap_log_path, "w") as f:
-                f.write("lap,lap_time_s,lap_score\n")
-
+        # best metrics and best CSV (single-line)
         self.best_lap_time = None
         self.best_score = None
+        self.best_lap_num = None
+        self.best_penalties_count = None
+
+        self.declare_parameter("best_out_file", "")  # optional override
+        best_user = self.get_parameter("best_out_file").value
+        best_dir = str(FsPath(self.lap_log_path).parent)
+        self.best_log_path = _resolve_best_log_path(best_user, best_dir)
+
+        if not FsPath(self.best_log_path).exists():
+            with open(self.best_log_path, "w") as f:
+                f.write("lap,lap_time_s,lap_score,penalties_pylon,penalties_oob\n")
 
     def _gates_crossed_ordered(self, a_xy, b_xy):
         """Return all gates crossed by segment a->b as [(t_along_AB, gate_index), ...], sorted by t."""
@@ -496,11 +517,11 @@ class CourseNode(Node):
 
             in_now = self._in_bounds_rect(b_xy)
 
-            # Penalize only on the transition: inside -> outside
             if self.in_bounds_prev and (not in_now):
                 pen = float(self.out_of_bounds_penalty_s)
                 if pen > 0.0:
                     self.penalties_this_lap += pen
+                    self.oob_events_count += 1  # <-- NEW
                     self.status(
                         f"Out of bounds: +{pen:.1f}s (total {self.penalties_this_lap:.1f}s)."
                     )
@@ -537,6 +558,7 @@ class CourseNode(Node):
                 missed = (gidx - expected) % n
                 if missed > 0:
                     add_pen = missed * self.missed_gate_penalty_s
+                    self.missed_gates_count += missed  # count missed gates
                     self.penalties_this_lap += add_pen
                     self.status(
                         f"Missed {missed} gate(s): +{add_pen:.1f}s (total {self.penalties_this_lap:.1f}s)."
@@ -544,7 +566,6 @@ class CourseNode(Node):
                     self.curr_gate_idx = (gidx + 1) % n
                 # if missed == 0, it's the same gate re-crossed after we advanced; ignore.
 
-            # LAP COMPLETE only when we actually cross G1
             if gidx == 0:
                 lap_t = now - self.lap_start_monotonic
                 final_score = lap_t + self.penalties_this_lap
@@ -557,19 +578,36 @@ class CourseNode(Node):
                     f"LAP {self.lap_count} COMPLETE: {lap_t:.3f}s + {self.penalties_this_lap:.1f}s = {final_score:.3f}s"
                 )
 
-                # log/best lap updates here
-                try:
-                    with open(self.lap_log_path, "a") as f:
-                        f.write(f"{self.lap_count},{lap_t:.6f},{final_score:.6f}\n")
-                    self.logged_laps += 1
-                    if self.logged_laps == 1:
-                        self.status(f"Lap log started → {self.lap_log_path}")
-                except Exception as e:
-                    self.get_logger().warn(f"Failed to write lap log: {e}")
+                # append to lap CSV
+                with open(self.lap_log_path, "a") as f:
+                    f.write(
+                        f"{self.lap_count},{lap_t:.6f},{final_score:.6f},"
+                        f"{self.missed_gates_count},{self.oob_events_count}\n"
+                    )
+
+                # update best and overwrite single-line CSV if improved
+                if (self.best_score is None) or (final_score < self.best_score):
+                    self.best_score = final_score
+                    self.best_lap_time = lap_t
+                    self.best_lap_num = self.lap_count
+                    try:
+                        with open(self.best_log_path, "w") as f:
+                            f.write(
+                                "lap,lap_time_s,lap_score,penalties_pylon,penalties_oob\n"
+                            )
+                            f.write(
+                                f"{self.best_lap_num},{self.best_lap_time:.6f},{self.best_score:.6f},"
+                                f"{self.missed_gates_count},{self.oob_events_count}\n"
+                            )
+                        self.status(f"Best score updated → {self.best_log_path}")
+                    except Exception as e:
+                        self.get_logger().warn(f"Failed to write best score: {e}")
 
                 # reset for next lap
                 self.lap_start_monotonic = now
                 self.penalties_this_lap = 0.0
+                self.missed_gates_count = 0  # reset counter
+                self.oob_events_count = 0  # reset counter
                 self.curr_gate_idx = 1  # after G1, expect G2
 
         self.prev_xy = b_xy

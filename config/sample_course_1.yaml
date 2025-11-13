@@ -9,7 +9,7 @@ centerline_closed: true
 
 # Pylons (meters, map frame)
 pylons:
-  - {x: -20.0, y:  -5.0, z: 0.0, r: 0.25, name: P1}
+  - {x: -20.0, y:  5.0, z: 0.0, r: 0.25, name: P1}
   - {x: -20.0, y: -20.0, z: 0.0, r: 0.25, name: P2}
   - {x: -25.0, y: -45.0, z: 0.0, r: 0.25, name: P3}
   - {x:  20.0, y: -25.0, z: 0.0, r: 0.25, name: P4}

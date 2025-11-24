@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from datetime import datetime
 from pathlib import Path as FsPath
+import shutil
 
 import rclpy
 from rclpy.node import Node
@@ -109,6 +110,19 @@ def _resolve_best_log_path(user_param: Optional[str], default_dir: str) -> str:
         return str(base / p.name)
 
     return str(base / "best_score.csv")
+
+# ---------------- path to container log ------------
+def _publish_submit_copy(src_path: str,
+                         env_var: str = "JUPYTERHUB_USER",
+                         submit_root: str = "/submit") -> str | None:
+    email = os.environ.get(env_var, "").strip()
+    if not email:
+        return None
+    dst_dir = os.path.join(submit_root, email, "logs")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, "best_score.csv")
+    shutil.copyfile(src_path, dst)  # overwrite with exact contents
+    return dst
 
 
 # ---------------- Small vec helpers ----------------
@@ -235,7 +249,7 @@ class CourseNode(Node):
 
         # ----------- Penalties and Scoring -----------
         self.missed_gate_penalty_s = float(p.get("missed_gate_penalty_s", 3.0))
-        self.penalties_this_lap = 0.0  # initilize
+        self.penalties_this_lap = 0.0  # initialize
         #  Out-of-bounds handling
         self.out_of_bounds_penalty_s = float(p.get("out_of_bounds_penalty_s", 0.0))
         self.bounds_rect = p.get("bounds_rect", None)
@@ -312,6 +326,20 @@ class CourseNode(Node):
         best_user = self.get_parameter("best_out_file").value
         best_dir = str(FsPath(self.lap_log_path).parent)
         self.best_log_path = _resolve_best_log_path(best_user, best_dir)
+
+        ### Save to Geddes Leaderboard
+        self.save_to_geddes = True
+        if self.save_to_geddes:
+            # mirror once at startup so the file exists in /submit/...
+            try:
+                sub_path = _publish_submit_copy(self.best_log_path)
+                if sub_path:
+                    self.status(f"Submit copy initialized → {sub_path}")
+                else:
+                    self.status("Submit copy not created (JUPYTERHUB_USER unset).")
+            except Exception as e:
+                self.get_logger().warn(f"Submit copy failed: {e}")
+
 
         if not FsPath(self.best_log_path).exists():
             with open(self.best_log_path, "w") as f:
@@ -600,6 +628,13 @@ class CourseNode(Node):
                                 f"{self.missed_gates_count},{self.oob_events_count}\n"
                             )
                         self.status(f"Best score updated → {self.best_log_path}")
+
+                        if self.save_to_geddes:
+                            try:
+                                _publish_submit_copy(self.best_log_path)
+                            except Exception as e:
+                                self.get_logger().warn(f"Failed to mirror best_score.csv: {e}")
+
                     except Exception as e:
                         self.get_logger().warn(f"Failed to write best score: {e}")
 

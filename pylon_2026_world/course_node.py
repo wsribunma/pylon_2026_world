@@ -12,7 +12,7 @@ import shutil
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-
+import csv
 from ament_index_python.packages import get_package_share_directory
 
 from std_msgs.msg import Float32, Int32, String
@@ -112,17 +112,51 @@ def _resolve_best_log_path(user_param: Optional[str], default_dir: str) -> str:
     return str(base / "best_score.csv")
 
 # ---------------- path to container log ------------
-def _publish_submit_copy(src_path: str,
-                         env_var: str = "JUPYTERHUB_USER",
-                         submit_root: str = "/submit") -> str | None:
+def _read_best_score_from_csv(path: str) -> Optional[float]:
+    """Read lap_score (3rd column) from a best_score.csv (header on first line)."""
+    try:
+        with open(path, "r") as f:
+            rows = [r for r in csv.reader(f) if r]  # keep non-empty
+        if len(rows) <= 1:
+            return None  # header only / empty
+        last = rows[-1]
+        return float(last[2]) if len(last) >= 3 else None
+    except Exception:
+        return None
+
+def _maybe_update_submit_best(src_path: str,
+                              env_var: str = "JUPYTERHUB_USER",
+                              submit_root: str = "/submit") -> tuple[Optional[str], Optional[bool]]:
+    """
+    Ensure /submit/<email>/logs/best_score.csv contains the *better* score.
+    Returns (dest_path, replaced?) where replaced? is:
+        True  -> copied new file,
+        False -> kept existing (it was better or equal),
+        None  -> not attempted (no env or permisssion error).
+    """
     email = os.environ.get(env_var, "").strip()
     if not email:
-        return None
+        return (None, None)
+
     dst_dir = os.path.join(submit_root, email, "logs")
-    os.makedirs(dst_dir, exist_ok=True)
     dst = os.path.join(dst_dir, "best_score.csv")
-    shutil.copyfile(src_path, dst)  # overwrite with exact contents
-    return dst
+    os.makedirs(dst_dir, exist_ok=True)
+
+    new_score = _read_best_score_from_csv(src_path)
+    if new_score is None:
+        # If new file unreadable, just copy to be safe
+        shutil.copyfile(src_path, dst)
+        return (dst, True)
+
+    if os.path.exists(dst):
+        old_score = _read_best_score_from_csv(dst)
+        if old_score is not None and old_score <= new_score:
+            # Existing submit score is already better or equal — keep it
+            return (dst, False)
+
+    shutil.copyfile(src_path, dst)
+    return (dst, True)
+
 
 
 # ---------------- Small vec helpers ----------------
@@ -330,15 +364,16 @@ class CourseNode(Node):
         ### Save to Geddes Leaderboard
         self.save_to_geddes = True
         if self.save_to_geddes:
-            # mirror once at startup so the file exists in /submit/...
             try:
-                sub_path = _publish_submit_copy(self.best_log_path)
-                if sub_path:
-                    self.status(f"Submit copy initialized → {sub_path}")
-                else:
+                dst_path, replaced = _maybe_update_submit_best(self.best_log_path)
+                if dst_path is None:
                     self.status("Submit copy not created (JUPYTERHUB_USER unset).")
+                elif replaced:
+                    self.status(f"Submit best initialized → {dst_path}")
+                else:
+                    self.status(f"Submit best kept (existing is as good or better) → {dst_path}")
             except Exception as e:
-                self.get_logger().warn(f"Submit copy failed: {e}")
+                self.get_logger().warn(f"Submit copy init failed: {e}")
 
 
         if not FsPath(self.best_log_path).exists():
@@ -620,23 +655,28 @@ class CourseNode(Node):
                     self.best_lap_num = self.lap_count
                     try:
                         with open(self.best_log_path, "w") as f:
-                            f.write(
-                                "lap,lap_time_s,lap_score,penalties_pylon,penalties_oob\n"
-                            )
+                            f.write("lap,lap_time_s,lap_score,penalties_pylon,penalties_oob\n")
                             f.write(
                                 f"{self.best_lap_num},{self.best_lap_time:.6f},{self.best_score:.6f},"
                                 f"{self.missed_gates_count},{self.oob_events_count}\n"
                             )
                         self.status(f"Best score updated → {self.best_log_path}")
 
+                        # Only update /submit/<email>/logs/best_score.csv if the new score is better
                         if self.save_to_geddes:
                             try:
-                                _publish_submit_copy(self.best_log_path)
+                                dst_path, replaced = _maybe_update_submit_best(self.best_log_path)
+                                if dst_path is not None:
+                                    if replaced:
+                                        self.status(f"Submit best updated → {dst_path}")
+                                    else:
+                                        self.status("Submit best kept (existing is better or equal).")
                             except Exception as e:
                                 self.get_logger().warn(f"Failed to mirror best_score.csv: {e}")
 
                     except Exception as e:
                         self.get_logger().warn(f"Failed to write best score: {e}")
+
 
                 # reset for next lap
                 self.lap_start_monotonic = now

@@ -256,6 +256,22 @@ def _resolve_lap_log_path(user_param: str | None) -> str:
     home_logs.mkdir(parents=True, exist_ok=True)
     return str(home_logs / name)
 
+def _copy_submit_lap_log(src_path: str,
+                         env_var: str = "JUPYTERHUB_USER",
+                         submit_root: str = "/submit") -> str | None:
+    """
+    Copy the current lap log (e.g., pylon_laps_YYYYMMDD_HHMMSS.csv)
+    to /submit/<email>/logs/ with the SAME basename.
+    """
+    email = os.environ.get(env_var, "").strip()
+    if not email:
+        return None
+    dst_dir = os.path.join(submit_root, email, "logs")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, os.path.basename(src_path))
+    shutil.copyfile(src_path, dst)  # overwrite each time
+    return dst
+
 
 # ---------------- Node ----------------
 class CourseNode(Node):
@@ -374,6 +390,12 @@ class CourseNode(Node):
                     self.status(f"Submit best kept (existing is as good or better) → {dst_path}")
             except Exception as e:
                 self.get_logger().warn(f"Submit copy init failed: {e}")
+            # also save to /submit/<email>/logs/ with same filename
+            try:
+                _copy_submit_lap_log(self.lap_log_path)
+            except Exception as e:
+                self.get_logger().warn(f"Submit lap log init copy failed: {e}")
+
 
 
         if not FsPath(self.best_log_path).exists():
@@ -647,6 +669,13 @@ class CourseNode(Node):
                         f"{self.lap_count},{lap_t:.6f},{final_score:.6f},"
                         f"{self.missed_gates_count},{self.oob_events_count}\n"
                     )
+                if self.save_to_geddes:
+                    # mirror the updated lap log to /submit/<email>/logs/pylon_laps_...csv
+                    try:
+                        _copy_submit_lap_log(self.lap_log_path)
+                    except Exception as e:
+                        self.get_logger().warn(f"Failed to mirror lap log: {e}")
+
 
                 # update best and overwrite single-line CSV if improved
                 if (self.best_score is None) or (final_score < self.best_score):

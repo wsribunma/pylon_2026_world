@@ -3,6 +3,9 @@ import os
 import math
 import time
 import yaml
+import json
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from datetime import datetime
@@ -156,6 +159,50 @@ def _maybe_update_submit_best(src_path: str,
 
     shutil.copyfile(src_path, dst)
     return (dst, True)
+
+
+def _submit_score_to_api(
+    user_email: str,
+    lap_number: int,
+    lap_time: float,
+    lap_score: float,
+    penalties_pylon: int,
+    penalties_oob: int,
+    api_url: str = "http://localhost:8000/api/score"
+) -> tuple[bool, str]:
+    """
+    Submit best score to the frontend API.
+    Returns (success, message).
+    """
+    try:
+        payload = {
+            "user_email": user_email,
+            "lap_number": lap_number,
+            "lap_time": lap_time,
+            "lap_score": lap_score,
+            "penalties_pylon": penalties_pylon,
+            "penalties_oob": penalties_oob,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            api_url,
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return (True, result.get("message", "Score submitted"))
+    
+    except urllib.error.URLError as e:
+        return (False, f"Network error: {e.reason}")
+    except urllib.error.HTTPError as e:
+        return (False, f"HTTP error {e.code}: {e.reason}")
+    except Exception as e:
+        return (False, f"Error: {str(e)}")
 
 
 
@@ -376,6 +423,11 @@ class CourseNode(Node):
         best_user = self.get_parameter("best_out_file").value
         best_dir = str(FsPath(self.lap_log_path).parent)
         self.best_log_path = _resolve_best_log_path(best_user, best_dir)
+
+        # API endpoint for score submission
+        self.declare_parameter("api_url", "https://pylon-racing.geddes.rcac.purdue.edu/api/score")
+        self.api_url = self.get_parameter("api_url").get_parameter_value().string_value
+        self.user_email = os.environ.get("JUPYTERHUB_USER", "").strip() or "anonymous@local"
 
         ### Save to Geddes Leaderboard
         self.save_to_geddes = True
@@ -690,6 +742,21 @@ class CourseNode(Node):
                                 f"{self.missed_gates_count},{self.oob_events_count}\n"
                             )
                         self.status(f"Best score updated → {self.best_log_path}")
+
+                        # Submit best score to API
+                        api_success, api_msg = _submit_score_to_api(
+                            user_email=self.user_email,
+                            lap_number=self.best_lap_num,
+                            lap_time=self.best_lap_time,
+                            lap_score=self.best_score,
+                            penalties_pylon=self.missed_gates_count,
+                            penalties_oob=self.oob_events_count,
+                            api_url=self.api_url
+                        )
+                        if api_success:
+                            self.status(f"API: {api_msg}")
+                        else:
+                            self.get_logger().warn(f"API submission failed: {api_msg}")
 
                         # Only update /submit/<email>/logs/best_score.csv if the new score is better
                         if self.save_to_geddes:

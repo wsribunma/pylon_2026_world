@@ -25,7 +25,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            "course_node = pylon_2026_world.course_node:main"
+            "course_node = pylon_2026_world.course_node:main",
+            "purt_course_node = pylon_2026_world.purt_course_node:main"
         ],
     },
 )
